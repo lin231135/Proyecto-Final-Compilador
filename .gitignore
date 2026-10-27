@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+
+# generated/ SI se versiona: asi el compilador corre sin Java instalado.
+# Se regenera con `python build_grammar.py` cuando cambie grammar/Compiscript.g4.
