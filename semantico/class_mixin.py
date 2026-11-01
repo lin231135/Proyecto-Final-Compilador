@@ -112,7 +112,7 @@ class ClassMixin:
         else:
             tipo_retorno = VOID
 
-        return FunctionType(param_types=tuple(tipos_param), return_type=tipo_retorno)
+        return FunctionType(param_types=tuple(tipos_param), return_type=tipo_retorno, decl=fn_ctx)
 
     # ------------------------------------------------------------------
     # this / new

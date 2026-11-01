@@ -527,6 +527,7 @@ class TypeMixin:
             if simbolo is None:
                 return
             self._check_assignment(ctx, simbolo.type, tipo_valor, simbolo.kind == "const", nombre)
+            self._precisar_tipo_null(simbolo, tipo_valor)
             return
 
         # expression '.' Identifier '=' expression
@@ -540,9 +541,20 @@ class TypeMixin:
         tipo_destino, es_const, descripcion = self.resolver_destino(ctx.lhs)
         tipo_valor = self.get_type(ctx.assignmentExpr())
         self._check_assignment(ctx, tipo_destino, tipo_valor, es_const, descripcion)
+        if not ctx.lhs.suffixOp() and isinstance(ctx.lhs.primaryAtom(), CompiscriptParser.IdentifierExprContext):
+            simbolo = self.table.current().resolve(ctx.lhs.primaryAtom().Identifier().getText())
+            if simbolo is not None:
+                self._precisar_tipo_null(simbolo, tipo_valor)
         t = ERROR if tipo_destino == ERROR else tipo_destino
         ctx.tipo = t
         return t
+
+    @staticmethod
+    def _precisar_tipo_null(simbolo: Symbol, tipo_valor: Type) -> None:
+        """`let d = null;` no tiene tipo real y acepta cualquier clase o lista;
+        se anota lo que recibe porque lo necesita la generacion de codigo."""
+        if simbolo.type == NULL and isinstance(tipo_valor, (ClassType, ArrayType)):
+            simbolo.tipo_asignado = tipo_valor
 
     def visitPropertyAssignExpr(self, ctx: "CompiscriptParser.PropertyAssignExprContext") -> Type:
         contenedor = self.get_type(ctx.lhs)

@@ -97,7 +97,7 @@ class FunctionMixin:
             for p in ctx.parameters().parameter():
                 tipos_param.append(self._tipo_parametro(p))
 
-        if self.current_class is not None and nombre == "constructor":
+        if self.current_class is not None and not self.function_stack and nombre == "constructor":
             # constructor -> retorno VOID implicito, sin importar
             # lo que se haya escrito despues de ':'.
             tipo_retorno = VOID
@@ -106,10 +106,12 @@ class FunctionMixin:
         else:
             tipo_retorno = VOID  # sin ': type' -> VOID
 
-        tipo_funcion = FunctionType(param_types=tuple(tipos_param), return_type=tipo_retorno)
+        tipo_funcion = FunctionType(param_types=tuple(tipos_param), return_type=tipo_retorno, decl=ctx)
 
         ya_prepasada = id(ctx) in getattr(self, "_nodos_prepasados", ())
-        if self.current_class is None and not ya_prepasada:
+        # Una funcion anidada en un metodo se declara como cualquier otra; los
+        # metodos, en cambio, los registra class_mixin en ClassType.methods.
+        if (self.current_class is None or self.function_stack) and not ya_prepasada:
             # el nombre queda visible ANTES de visitar el cuerpo,
             # en el scope donde se declara (global o el de una funcion
             # contenedora) -> recursion directa/mutua y funciones anidadas.
@@ -175,14 +177,29 @@ class FunctionMixin:
                 f"se esperaban {len(esperados)} argumento(s), se recibieron {len(argumentos)}",
             )
             return
-        for esperado, arg in zip(esperados, argumentos):
+        for i, (esperado, arg) in enumerate(zip(esperados, argumentos)):
             tipo_arg = self.get_type(arg)
+            if esperado == ERROR:
+                self._anotar_argumento(tipo_funcion, i, tipo_arg)
             if esperado != ERROR and tipo_arg != ERROR and not is_assignable(esperado, tipo_arg):
                 self.reporter.error(
                     arg,
                     "funcion",
                     f"argumento de tipo {tipo_arg!r} no es asignable al parametro de tipo {esperado!r}",
                 )
+
+    @staticmethod
+    def _anotar_argumento(tipo_funcion: FunctionType, indice: int, tipo_arg) -> None:
+        """Un parametro sin anotacion acepta cualquier cosa en el semantico,
+        pero el back-end necesita su tipo: se recuerdan los argumentos reales
+        para que el generador lo deduzca (`TACGenerator._tipo_de_parametro`)."""
+        decl = tipo_funcion.decl
+        if decl is None or tipo_arg == ERROR or decl.parameters() is None:
+            return
+        parametro = decl.parameters().parameter(indice)
+        if not hasattr(parametro, "tipos_de_llamada"):
+            parametro.tipos_de_llamada = []
+        parametro.tipos_de_llamada.append(tipo_arg)
 
     def _aplicar_llamada(self, tipo_base, ctx: "CompiscriptParser.CallExprContext"):
         if tipo_base == ERROR:
