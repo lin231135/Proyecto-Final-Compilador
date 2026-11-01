@@ -15,9 +15,12 @@ Convenciones (docentes, no corresponden a una ABI real):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from core.types import BOOLEAN, FLOAT, INTEGER, Type
+
+_NOMBRE_TEMPORAL = re.compile(r"^t\d+$")
 
 POINTER_SIZE = 8
 WORD = 8  # tamano de un temporal (guarda cualquier valor)
@@ -112,11 +115,21 @@ class ActivationRecord:
             n += 1
         return f"{name}_{n}"
 
+    def _nombre_de_variable(self, name: str) -> str:
+        """Una variable del fuente llamada `t1` no puede llamarse igual que
+        el temporal `t1` en el TAC: se renombra como una sombra (`t1_2`)."""
+        if _NOMBRE_TEMPORAL.match(name):
+            name = f"{name}_2"
+        return self.unique_name(name)
+
     def add_param(self, name: str, tipo: Type | None) -> Slot:
-        return self._add(self.unique_name(name), "param", tipo, size_of(tipo))
+        return self._add(self._nombre_de_variable(name), "param", tipo, size_of(tipo))
 
     def add_local(self, name: str, tipo: Type | None) -> Slot:
-        return self._add(self.unique_name(name), "local", tipo, size_of(tipo))
+        return self._add(self._nombre_de_variable(name), "local", tipo, size_of(tipo))
+
+    def slot(self, name: str) -> Slot | None:
+        return self._by_tac_name.get(name)
 
     def add_global(self, name: str, tipo: Type | None) -> Slot:
         return self._add(self.unique_name(name), "global", tipo, size_of(tipo))

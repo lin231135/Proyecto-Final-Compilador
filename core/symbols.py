@@ -44,6 +44,8 @@ class Symbol:
     label: str | None = None  # etiqueta TAC (funciones: `f`, `f.g`, `Clase.m`)
     tac_name: str = ""  # nombre del operando en el TAC (`x`, `x_2`, `@x`)
     frame: object | None = None  # ActivationRecord que contiene la ranura
+    # `let d = null;` no tiene tipo real: aqui queda el de lo que se le asigna.
+    tipo_asignado: Type | None = None
 
 
 class Scope:

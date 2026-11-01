@@ -46,6 +46,10 @@ class ArrayType(Type):
 class FunctionType(Type):
     param_types: tuple[Type, ...]
     return_type: Type
+    # Declaracion de la funcion (FunctionDeclarationContext): no forma parte
+    # de la identidad del tipo. El semantico la usa para anotar en cada
+    # parametro sin tipo los argumentos con los que se le llama.
+    decl: object = field(default=None, compare=False, repr=False)
 
     def __repr__(self) -> str:
         params = ", ".join(repr(p) for p in self.param_types)
