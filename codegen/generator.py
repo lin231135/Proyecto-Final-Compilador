@@ -35,12 +35,44 @@ from core.memory import (
     size_of,
 )
 from core.symbols import Scope, Symbol, SymbolTable
-from core.types import ArrayType, ClassType, FunctionType, VOID, Type
+from core.types import (
+    BOOLEAN,
+    ERROR,
+    FLOAT,
+    INTEGER,
+    NULL,
+    STRING,
+    VOID,
+    ArrayType,
+    ClassType,
+    FunctionType,
+    Type,
+    is_numeric,
+    max_tipo,
+)
 from generated.CompiscriptParser import CompiscriptParser as P
 from generated.CompiscriptVisitor import CompiscriptVisitor
 
 _NUM_RE = re.compile(r"^\d+(\.\d+)?$")
+_UP_RE = re.compile(r"^up(\d+)\.(.+)$")
 OBJECT_HEADER = 8  # puntero al descriptor de clase (despacho virtual)
+
+
+def _base_de_lista(tipo: Type | None) -> Type | None:
+    """Tipo escalar de una lista (de cualquier dimension); None si no es lista."""
+    if not isinstance(tipo, ArrayType):
+        return None
+    while isinstance(tipo, ArrayType):
+        tipo = tipo.element_type
+    return tipo
+
+
+def _hereda(clase: ClassType | None, ancestro: ClassType) -> bool:
+    while clase is not None:
+        if clase == ancestro:
+            return True
+        clase = clase.parent
+    return False
 
 
 class CodegenError(Exception):
@@ -53,8 +85,12 @@ class FuncState:
     ar: ActivationRecord
     tac: TACFunction
     temps: TempManager = field(default_factory=TempManager)
-    loops: list[tuple[str, str | None]] = field(default_factory=list)  # (break, continue)
+    # (etiqueta de break, etiqueta de continue, try abiertos al entrar al bucle)
+    loops: list[tuple[str, str | None, int]] = field(default_factory=list)
     is_main: bool = False
+    ret_type: Type | None = None
+    temp_tipos: dict[str, Type | None] = field(default_factory=dict)  # tipo actual de cada temporal
+    try_depth: int = 0  # bloques `try` abiertos en este punto
 
 
 class TACGenerator(CompiscriptVisitor):
@@ -71,7 +107,10 @@ class TACGenerator(CompiscriptVisitor):
         self.closure_accesses: list[ClosureAccess] = []
         self.temp_leaks = 0  # temporales vivos al terminar una sentencia (debe ser 0)
         self._label_count = 0
-        self._labels_usados: set[str] = set()
+        self._labels_usados: set[str] = {"main"}  # `main` es el programa principal
+        # Construcciones que el TAC representa pero que no se pueden traducir
+        # a un back-end con tipos estaticos; `backend/` las reporta como error.
+        self.errores_backend: list[str] = []
         self.fn: FuncState = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
@@ -90,13 +129,14 @@ class TACGenerator(CompiscriptVisitor):
 
         # Las funciones globales llevan su propio nombre como etiqueta, asi
         # una llamada puede preceder (en el texto) a la declaracion.
+        for layout in self.layouts.values():
+            self._labels_usados.update(f"{layout.name}.{m}" for m in layout.own_methods)
         for stmt in tree.statement():
             fd = stmt.functionDeclaration()
             if fd is not None:
                 sym = self.table.global_scope.resolve_local(fd.Identifier().getText())
                 if sym is not None:
-                    self._labels_usados.add(sym.name)
-                    sym.label = sym.name
+                    sym.label = self._etiqueta_unica(sym.name)
                     sym.storage = "function"
 
         for stmt in tree.statement():
@@ -161,7 +201,11 @@ class TACGenerator(CompiscriptVisitor):
     # Utilidades de emision
     # ------------------------------------------------------------------
 
-    def emit(self, instr: T.Instr) -> T.Instr:
+    def emit(self, instr: T.Instr, tipo: Type | None = None) -> T.Instr:
+        """Agrega `instr` anotada con el tipo del valor que define."""
+        instr.ty = tipo
+        if is_temp(instr.dst):
+            self.fn.temp_tipos[instr.dst] = tipo
         return self.fn.tac.emit(instr)
 
     def temp(self) -> str:
@@ -186,9 +230,127 @@ class TACGenerator(CompiscriptVisitor):
             and instrs[-1].dst == lugar
         ):
             instrs[-1].dst = destino
+            if is_temp(destino):
+                self.fn.temp_tipos[destino] = instrs[-1].ty
         else:
-            self.emit(T.copy(destino, lugar))
+            self.emit(T.copy(destino, lugar), self._tipo_lugar(lugar))
         self.free(lugar)
+
+    # ------------------------------------------------------------------
+    # Tipos: el TAC se imprime sin tipos, pero cada instruccion los lleva
+    # anotados y la conversion integer -> float se hace explicita (`itof`)
+    # ------------------------------------------------------------------
+
+    def _tipo_lugar(self, lugar: str | None) -> Type | None:
+        """Tipo estatico del valor que hay en `lugar`."""
+        if lugar is None:
+            return None
+        if lugar in ("true", "false"):
+            return BOOLEAN
+        if lugar == "null":
+            return NULL
+        if lugar.startswith('"'):
+            return STRING
+        if _NUM_RE.match(lugar.lstrip("-")):
+            return FLOAT if "." in lugar else INTEGER
+        if is_temp(lugar):
+            return self.fn.temp_tipos.get(lugar)
+        if lugar.startswith("@"):
+            return self.global_area.slot(lugar[1:]).type
+        m = _UP_RE.match(lugar)
+        ar, nombre = self.fn.ar, lugar
+        if m:
+            for _ in range(int(m.group(1))):
+                ar = ar.parent
+            nombre = m.group(2)
+        ranura = ar.slot(nombre)
+        return ranura.type if ranura is not None else None
+
+    def _convertir(self, lugar: str, destino: Type | None) -> str:
+        """Conversion implicita de `lugar` al tipo `destino` (integer -> float)."""
+        tipo = self._tipo_lugar(lugar)
+        if destino == FLOAT and tipo == INTEGER:
+            if not is_temp(lugar) and _NUM_RE.match(lugar.lstrip("-")):
+                return f"{lugar}.0"
+            self.free(lugar)
+            dst = self.temp()
+            self.emit(T.itof(dst, lugar), FLOAT)
+            return dst
+        if _base_de_lista(destino) == FLOAT and _base_de_lista(tipo) == INTEGER:
+            self.errores_backend.append(
+                f"no se puede convertir la lista de tipo {tipo!r} a {destino!r} sin copiarla: "
+                "use una lista de float desde el inicio"
+            )
+        return lugar
+
+    def _visitar_como(self, ctx, destino: Type | None) -> str:
+        """Evalua `ctx` y lo convierte a `destino`. Un literal de lista toma
+        directamente el tipo de elemento esperado (`let a: float[] = [1, 2]`)."""
+        n = self._peel(ctx)
+        if isinstance(n, P.LiteralExprContext) and n.arrayLiteral() is not None and isinstance(destino, ArrayType):
+            return self._lista(n.arrayLiteral(), destino.element_type)
+        return self._convertir(self.visit(ctx), destino)
+
+    def _unificar_numericos(self, a: str, b: str) -> tuple[str, str]:
+        """En una operacion integer-float el integer se convierte a float."""
+        ta, tb = self._tipo_lugar(a), self._tipo_lugar(b)
+        if ta == FLOAT and tb == INTEGER:
+            return a, self._convertir(b, FLOAT)
+        if ta == INTEGER and tb == FLOAT:
+            return self._convertir(a, FLOAT), b
+        return a, b
+
+    def _tipo_de_parametro(self, firma: FunctionType | None, i: int) -> Type | None:
+        """Tipo del parametro `i`; si no tiene anotacion, el de sus argumentos."""
+        if firma is None or i >= len(firma.param_types):
+            return None
+        tipo = firma.param_types[i]
+        if tipo == ERROR and firma.decl is not None:
+            return self._tipo_deducido(firma.decl.parameters().parameter(i))
+        return tipo
+
+    def _tipo_deducido(self, parametro: P.ParameterContext) -> Type | None:
+        """Combina los tipos de los argumentos con los que se llama a un
+        parametro sin anotacion (los anota el semantico)."""
+        if hasattr(parametro, "tipo_deducido"):
+            return parametro.tipo_deducido
+        resultado: Type | None = None
+        for tipo in getattr(parametro, "tipos_de_llamada", []):
+            resultado = self._combinar(resultado, tipo, parametro)
+        parametro.tipo_deducido = resultado
+        return resultado
+
+    def _combinar(self, a: Type | None, b: Type, parametro: P.ParameterContext) -> Type | None:
+        if a is None or a == NULL or a == b:
+            return b
+        if b == NULL:
+            return a
+        if is_numeric(a) and is_numeric(b):
+            return max_tipo(a, b)
+        if isinstance(a, ClassType) and isinstance(b, ClassType):
+            ancestro = a
+            while ancestro is not None:
+                if _hereda(b, ancestro):
+                    return ancestro
+                ancestro = ancestro.parent
+        self.errores_backend.append(
+            f"linea {parametro.start.line}: el parametro '{parametro.Identifier().getText()}' recibe "
+            f"argumentos de tipos distintos ({a!r} y {b!r}); agregue una anotacion de tipo"
+        )
+        return a
+
+    def _campo(self, tipo: Type | None, nombre: str) -> tuple[str | None, Type | None]:
+        """(clase, tipo del campo) de `tipo.nombre`, para anotar load/store_field."""
+        if isinstance(tipo, ClassType):
+            miembro = tipo.lookup_member(nombre)
+            if isinstance(miembro, FunctionType):
+                self.errores_backend.append(f"el metodo '{tipo.name}.{nombre}' no se puede usar como valor")
+            return tipo.name, miembro
+        # receptor de tipo desconocido (parametro sin anotacion y sin llamadas)
+        duenos = [c for c in self.layouts.values() if nombre in c.fields]
+        if duenos:
+            return duenos[0].name, duenos[0].fields[nombre].type
+        return None, None
 
     def _entrar(self, ctx):
         """Cambia al `Scope` que el semantico asocio a `ctx` (si lo hay)."""
@@ -202,12 +364,13 @@ class TACGenerator(CompiscriptVisitor):
 
     def _bind(self, sym: Symbol, kind: str) -> None:
         """Asigna a `sym` su ranura: area estatica (globales) o AR actual."""
+        tipo = sym.tipo_asignado if sym.type == NULL and sym.tipo_asignado is not None else sym.type
         if kind == "local" and self.scope is self.table.global_scope and self.fn.is_main:
-            slot = self.global_area.add_global(sym.name, sym.type)
+            slot = self.global_area.add_global(sym.name, tipo)
             sym.storage, sym.frame, sym.tac_name = "global", self.global_area, "@" + slot.name
         else:
             ar = self.fn.ar
-            slot = ar.add_param(sym.name, sym.type) if kind == "param" else ar.add_local(sym.name, sym.type)
+            slot = ar.add_param(sym.name, tipo) if kind == "param" else ar.add_local(sym.name, tipo)
             sym.storage, sym.frame, sym.tac_name = kind, ar, slot.name
         sym.offset, sym.size = slot.offset, slot.size
 
@@ -233,7 +396,7 @@ class TACGenerator(CompiscriptVisitor):
     def _value_of(self, sym: Symbol, nombre: str, linea: int) -> str:
         if sym.kind == "function":
             dst = self.temp()
-            self.emit(T.closure(dst, sym.label or nombre))
+            self.emit(T.closure(dst, sym.label or nombre), sym.type)
             return dst
         return self._place(sym, linea)
 
@@ -260,8 +423,7 @@ class TACGenerator(CompiscriptVisitor):
         nombre = ctx.Identifier().getText()
         sym = self._declare(nombre)
         if expr_ctx is not None:
-            valor = self.visit(expr_ctx)
-            self.emit_assign(sym.tac_name, valor)
+            self.emit_assign(sym.tac_name, self._visitar_como(expr_ctx, sym.type))
 
     def visitVariableDeclaration(self, ctx: P.VariableDeclarationContext):
         init = ctx.initializer()
@@ -276,12 +438,12 @@ class TACGenerator(CompiscriptVisitor):
         if len(expresiones) == 1:
             sym = self.scope.resolve(nombre)
             destino = self._place(sym, ctx.start.line)
-            valor = self.visit(expresiones[0])
-            self.emit_assign(destino, valor)
+            self.emit_assign(destino, self._visitar_como(expresiones[0], sym.type))
             return
         obj = self.visit(expresiones[0])
-        valor = self.visit(expresiones[1])
-        self.emit(T.store_field(obj, nombre, valor))
+        clase, tipo_campo = self._campo(self._tipo_lugar(obj), nombre)
+        valor = self._visitar_como(expresiones[1], tipo_campo)
+        self.emit(T.store_field(obj, nombre, valor)).clase = clase
         self.free(obj, valor)
 
     def visitExpressionStatement(self, ctx: P.ExpressionStatementContext):
@@ -289,9 +451,10 @@ class TACGenerator(CompiscriptVisitor):
 
     def visitPrintStatement(self, ctx: P.PrintStatementContext):
         valor = self.visit(ctx.expression())
+        tipo = self._tipo_lugar(valor)
         self.emit(T.param(valor))
         self.free(valor)
-        self.emit(T.call(None, "print", 1))
+        self.emit(T.call(None, "print", 1), tipo)
 
     def visitIfStatement(self, ctx: P.IfStatementContext):
         bloques = ctx.block()
@@ -311,7 +474,7 @@ class TACGenerator(CompiscriptVisitor):
         l_ini, l_fin = self.new_label(), self.new_label()
         self.emit(T.label(l_ini))
         self.jump_if_false(ctx.expression(), l_fin)
-        self.fn.loops.append((l_fin, l_ini))
+        self.fn.loops.append((l_fin, l_ini, self.fn.try_depth))
         self.visit(ctx.block())
         self.fn.loops.pop()
         self.emit(T.goto(l_ini))
@@ -320,7 +483,7 @@ class TACGenerator(CompiscriptVisitor):
     def visitDoWhileStatement(self, ctx: P.DoWhileStatementContext):
         l_ini, l_cont, l_fin = self.new_label(), self.new_label(), self.new_label()
         self.emit(T.label(l_ini))
-        self.fn.loops.append((l_fin, l_cont))
+        self.fn.loops.append((l_fin, l_cont, self.fn.try_depth))
         self.visit(ctx.block())
         self.fn.loops.pop()
         self.emit(T.label(l_cont))
@@ -354,7 +517,7 @@ class TACGenerator(CompiscriptVisitor):
         self.emit(T.label(l_ini))
         if cond is not None:
             self.jump_if_false(cond, l_fin)
-        self.fn.loops.append((l_fin, l_cont))
+        self.fn.loops.append((l_fin, l_cont, self.fn.try_depth))
         self.visit(ctx.block())
         self.fn.loops.pop()
         self.emit(T.label(l_cont))
@@ -370,16 +533,16 @@ class TACGenerator(CompiscriptVisitor):
         sym = self._declare(ctx.Identifier().getText())
         idx, largo = self.temp(), self.temp()
         l_ini, l_cont, l_fin = self.new_label(), self.new_label(), self.new_label()
-        self.emit(T.copy(idx, "0"))
-        self.emit(T.length(largo, coleccion))
+        self.emit(T.copy(idx, "0"), INTEGER)
+        self.emit(T.length(largo, coleccion), INTEGER)
         self.emit(T.label(l_ini))
         self.emit(T.if_rel(idx, ">=", largo, l_fin))
-        self.emit(T.load_index(sym.tac_name, coleccion, idx))
-        self.fn.loops.append((l_fin, l_cont))
+        self.emit(T.load_index(sym.tac_name, coleccion, idx), sym.type)
+        self.fn.loops.append((l_fin, l_cont, self.fn.try_depth))
         self.visit(ctx.block())
         self.fn.loops.pop()
         self.emit(T.label(l_cont))
-        self.emit(T.binop(idx, idx, "+", "1"))
+        self.emit(T.binop(idx, idx, "+", "1"), INTEGER)
         self.emit(T.goto(l_ini))
         self.emit(T.label(l_fin))
         self.free(coleccion, idx, largo)
@@ -388,13 +551,15 @@ class TACGenerator(CompiscriptVisitor):
     def visitTryCatchStatement(self, ctx: P.TryCatchStatementContext):
         l_catch, l_fin = self.new_label(), self.new_label()
         self.emit(T.Instr("try", name=l_catch))
+        self.fn.try_depth += 1
         self.visit(ctx.block(0))
+        self.fn.try_depth -= 1
         self.emit(T.Instr("endtry"))
         self.emit(T.goto(l_fin))
         self.emit(T.label(l_catch))
         anterior = self._entrar(ctx)
         sym = self._declare(ctx.Identifier().getText())
-        self.emit(T.Instr("catch", dst=sym.tac_name))
+        self.emit(T.Instr("catch", dst=sym.tac_name), STRING)
         for stmt in ctx.block(1).statement():
             self.visit(stmt)
         self.scope = anterior
@@ -413,7 +578,7 @@ class TACGenerator(CompiscriptVisitor):
             self.free(valor)
         self.emit(T.goto(l_defecto))
         self.free(sujeto)
-        self.fn.loops.append((l_fin, None))
+        self.fn.loops.append((l_fin, None, self.fn.try_depth))
         for caso, destino in zip(casos, l_casos):
             self.emit(T.label(destino))
             for stmt in caso.statement():
@@ -425,21 +590,31 @@ class TACGenerator(CompiscriptVisitor):
         self.fn.loops.pop()
         self.emit(T.label(l_fin))
 
+    def _cerrar_try(self, hasta: int) -> None:
+        """Un salto que abandona bloques `try` debe desactivar sus manejadores."""
+        for _ in range(self.fn.try_depth - hasta):
+            self.emit(T.Instr("endtry"))
+
     def visitBreakStatement(self, ctx: P.BreakStatementContext):
-        self.emit(T.goto(self.fn.loops[-1][0]))
+        l_fin, _, profundidad = self.fn.loops[-1]
+        self._cerrar_try(profundidad)
+        self.emit(T.goto(l_fin))
 
     def visitContinueStatement(self, ctx: P.ContinueStatementContext):
-        for _, l_cont in reversed(self.fn.loops):
+        for _, l_cont, profundidad in reversed(self.fn.loops):
             if l_cont is not None:
+                self._cerrar_try(profundidad)
                 self.emit(T.goto(l_cont))
                 return
         raise CodegenError("'continue' fuera de un bucle")
 
     def visitReturnStatement(self, ctx: P.ReturnStatementContext):
         if ctx.expression() is None:
+            self._cerrar_try(0)
             self.emit(T.ret())
             return
-        valor = self.visit(ctx.expression())
+        valor = self._visitar_como(ctx.expression(), self.fn.ret_type)
+        self._cerrar_try(0)
         self.emit(T.ret(valor))
         self.free(valor)
 
@@ -474,14 +649,19 @@ class TACGenerator(CompiscriptVisitor):
         fn.ar.finalize(fn.tac.temp_count)
         self.fn, self.scope = guardado
 
-    def _gen_function(self, ctx: P.FunctionDeclarationContext, etiqueta: str, clase: str | None) -> None:
+    def _gen_function(self, ctx: P.FunctionDeclarationContext, etiqueta: str, clase: str | None,
+                      ret_type: Type | None) -> None:
         guardado = self._begin_function(etiqueta, ctx.scope, "method" if clase else "function")
         ar, tac = self.fn.ar, self.fn.tac
+        self.fn.ret_type = ret_type
         if clase:
             ar.add_param("this", self.clases.get(clase))
             tac.params.append("this")
         if ctx.parameters() is not None:
             for p in ctx.parameters().parameter():
+                sym = self.scope.resolve_local(p.Identifier().getText())
+                if sym is not None and sym.type == ERROR:
+                    sym.type = self._tipo_deducido(p) or ERROR
                 sym = self._declare(p.Identifier().getText(), "param")
                 tac.params.append(sym.tac_name)
         for stmt in ctx.block().statement():
@@ -494,8 +674,9 @@ class TACGenerator(CompiscriptVisitor):
         if sym is not None and sym.label is None:
             sym.label = self._etiqueta_unica(nombre if self.fn.is_main else f"{self.fn.name}.{nombre}")
             sym.storage, sym.frame = "function", self.fn.ar
-        etiqueta = sym.label if sym is not None and sym.label else nombre
-        self._gen_function(ctx, etiqueta, None)
+        etiqueta = sym.label if sym is not None and sym.label else self._etiqueta_unica(nombre)
+        ret_type = sym.type.return_type if sym is not None and isinstance(sym.type, FunctionType) else None
+        self._gen_function(ctx, etiqueta, None, ret_type)
 
     def visitClassDeclaration(self, ctx: P.ClassDeclarationContext):
         nombre = ctx.Identifier(0).getText()
@@ -522,15 +703,18 @@ class TACGenerator(CompiscriptVisitor):
                     decl.expression() if miembro.constantDeclaration() is not None else None
                 )
                 if expr is not None:
-                    valor = self.visit(expr)
-                    self.emit(T.store_field("this", decl.Identifier().getText(), valor))
+                    campo = decl.Identifier().getText()
+                    valor = self._visitar_como(expr, layout.fields[campo].type)
+                    self.emit(T.store_field("this", campo, valor)).clase = nombre
                     self.free(valor)
             self._end_function(guardado)
 
         for miembro in ctx.classMember():
             fd = miembro.functionDeclaration()
             if fd is not None:
-                self._gen_function(fd, f"{nombre}.{fd.Identifier().getText()}", nombre)
+                metodo = fd.Identifier().getText()
+                firma = self.clases[nombre].methods.get(metodo) if nombre in self.clases else None
+                self._gen_function(fd, f"{nombre}.{metodo}", nombre, firma.return_type if firma else None)
         self.scope = anterior
 
     # ------------------------------------------------------------------
@@ -636,6 +820,7 @@ class TACGenerator(CompiscriptVisitor):
         op = n.getChild(1).getText()
         a = self.visit(izq_ctx)
         b = self.visit(der_ctx)
+        a, b = self._unificar_numericos(a, b)
         self.free(a, b)
         self.emit(T.if_rel(a, T.INVERSO[op] if invertir else op, b, destino))
 
@@ -644,10 +829,10 @@ class TACGenerator(CompiscriptVisitor):
         resultado = self.temp()
         l_falso, l_fin = self.new_label(), self.new_label()
         self.jump_if_false(ctx, l_falso)
-        self.emit(T.copy(resultado, "true"))
+        self.emit(T.copy(resultado, "true"), BOOLEAN)
         self.emit(T.goto(l_fin))
         self.emit(T.label(l_falso))
-        self.emit(T.copy(resultado, "false"))
+        self.emit(T.copy(resultado, "false"), BOOLEAN)
         self.emit(T.label(l_fin))
         return resultado
 
@@ -665,12 +850,13 @@ class TACGenerator(CompiscriptVisitor):
         if ctx.getChildCount() == 1:
             return self.visit(ctx.logicalOrExpr())
         resultado = self.temp()
+        tipo = getattr(ctx, "tipo", None)
         l_else, l_fin = self.new_label(), self.new_label()
         self.jump_if_false(ctx.logicalOrExpr(), l_else)
-        self.emit_assign(resultado, self.visit(ctx.expression(0)))
+        self.emit_assign(resultado, self._visitar_como(ctx.expression(0), tipo))
         self.emit(T.goto(l_fin))
         self.emit(T.label(l_else))
-        self.emit_assign(resultado, self.visit(ctx.expression(1)))
+        self.emit_assign(resultado, self._visitar_como(ctx.expression(1), tipo))
         self.emit(T.label(l_fin))
         return resultado
 
@@ -690,11 +876,20 @@ class TACGenerator(CompiscriptVisitor):
         for i in range(1, len(operandos)):
             op = ctx.getChild(2 * i - 1).getText()
             derecho = self.visit(operandos[i])
+            acumulado, derecho = self._unificar_numericos(acumulado, derecho)
+            tipo = self._tipo_binario(op, acumulado, derecho)
             self.free(acumulado, derecho)
             dst = self.temp()
-            self.emit(T.binop(dst, acumulado, op, derecho))
+            self.emit(T.binop(dst, acumulado, op, derecho), tipo)
             acumulado = dst
         return acumulado
+
+    def _tipo_binario(self, op: str, a: str, b: str) -> Type | None:
+        if op in T.INVERSO:
+            return BOOLEAN
+        ta, tb = self._tipo_lugar(a), self._tipo_lugar(b)
+        conocido = ta if ta not in (None, ERROR) else tb
+        return FLOAT if FLOAT in (ta, tb) else conocido
 
     def visitEqualityExpr(self, ctx: P.EqualityExprContext):
         return self._plegar_binario(ctx, ctx.relationalExpr())
@@ -717,9 +912,10 @@ class TACGenerator(CompiscriptVisitor):
             return interior[1:] if interior.startswith("-") else "-" + interior
         if op == "!" and interior in ("true", "false"):
             return "false" if interior == "true" else "true"
+        tipo = BOOLEAN if op == "!" else self._tipo_lugar(interior)
         self.free(interior)
         dst = self.temp()
-        self.emit(T.unop(dst, op, interior))
+        self.emit(T.unop(dst, op, interior), tipo)
         return dst
 
     def visitPrimaryExpr(self, ctx: P.PrimaryExprContext):
@@ -735,11 +931,15 @@ class TACGenerator(CompiscriptVisitor):
         return ctx.getText()
 
     def visitArrayLiteral(self, ctx: P.ArrayLiteralContext):
+        tipo = getattr(ctx, "tipo", None)
+        return self._lista(ctx, tipo.element_type if isinstance(tipo, ArrayType) else None)
+
+    def _lista(self, ctx: P.ArrayLiteralContext, tipo_elemento: Type | None) -> str:
         elementos = ctx.expression()
         dst = self.temp()
-        self.emit(T.newlist(dst, len(elementos)))
+        self.emit(T.newlist(dst, len(elementos)), ArrayType(tipo_elemento or ERROR))
         for i, e in enumerate(elementos):
-            valor = self.visit(e)
+            valor = self._visitar_como(e, tipo_elemento)
             self.emit(T.store_index(dst, str(i), valor))
             self.free(valor)
         return dst
@@ -751,20 +951,28 @@ class TACGenerator(CompiscriptVisitor):
         return self._value_of(self.scope.resolve(nombre), nombre, ctx.start.line)
 
     def visitThisExpr(self, ctx: P.ThisExprContext):
-        return "this"
+        return self._this()
+
+    def _this(self) -> str:
+        """`this` de un metodo; desde una funcion anidada en el, via enlace de acceso."""
+        ar, saltos = self.fn.ar, 0
+        while ar is not None and ar.slot("this") is None:
+            ar, saltos = ar.parent, saltos + 1
+        return f"up{saltos}.this" if ar is not None and saltos else "this"
 
     def visitNewExpr(self, ctx: P.NewExprContext):
         nombre = ctx.Identifier().getText()
         layout = self.layouts[nombre]
         obj = self.temp()
-        self.emit(T.new(obj, nombre, layout.instance_size))
+        self.emit(T.new(obj, nombre, layout.instance_size), self.clases.get(nombre))
         for c in layout.ancestry():
             if c.has_initializers:
                 self.emit(T.param(obj))
                 self.emit(T.call(None, f"{c.name}._init", 1))
         definidor = layout.resolve_method("constructor")
         if definidor is not None:
-            args = self._args(ctx.arguments())
+            firma = self.clases[nombre].lookup_member("constructor") if nombre in self.clases else None
+            args = self._args(ctx.arguments(), firma)
             self.emit(T.param(obj))
             for a in args:
                 self.emit(T.param(a))
@@ -777,8 +985,11 @@ class TACGenerator(CompiscriptVisitor):
     def visitLeftHandSide(self, ctx: P.LeftHandSideContext):
         return self._eval_lhs(ctx)[0]
 
-    def _args(self, args_ctx) -> list[str]:
-        return [self.visit(e) for e in args_ctx.expression()] if args_ctx is not None else []
+    def _args(self, args_ctx, firma: Type | None = None) -> list[str]:
+        if args_ctx is None:
+            return []
+        firma = firma if isinstance(firma, FunctionType) else None
+        return [self._visitar_como(e, self._tipo_de_parametro(firma, i)) for i, e in enumerate(args_ctx.expression())]
 
     def _emit_llamada(self, tipo_llamada: str, destino: str, receptor: str | None, args: list[str],
                       ret: Type | None, liberar: tuple = ()) -> str | None:
@@ -789,7 +1000,7 @@ class TACGenerator(CompiscriptVisitor):
             self.emit(T.param(a))
         self.free(receptor, *args, *liberar)
         dst = None if ret == VOID else self.temp()
-        self.emit(T.call(dst, destino, n, tipo_llamada))
+        self.emit(T.call(dst, destino, n, tipo_llamada), ret)
         return dst
 
     def _eval_lhs(self, ctx: P.LeftHandSideContext, hasta: int | None = None) -> tuple[str, Type | None]:
@@ -809,7 +1020,7 @@ class TACGenerator(CompiscriptVisitor):
         elif isinstance(atomo, P.NewExprContext):
             lugar, tipo = self.visit(atomo), getattr(atomo, "tipo", None)
         else:  # this
-            lugar, tipo = "this", getattr(atomo, "tipo", None)
+            lugar, tipo = self._this(), getattr(atomo, "tipo", None)
 
         while i < n:
             s = sufijos[i]
@@ -819,20 +1030,20 @@ class TACGenerator(CompiscriptVisitor):
                     lugar, tipo = self._llamada_metodo(lugar, tipo, nombre, sufijos[i + 1])
                     i += 2
                     continue
+                clase, tipo = self._campo(tipo, nombre)
                 self.free(lugar)
                 dst = self.temp()
-                self.emit(T.load_field(dst, lugar, nombre))
+                self.emit(T.load_field(dst, lugar, nombre), tipo).clase = clase
                 lugar = dst
-                tipo = tipo.lookup_member(nombre) if isinstance(tipo, ClassType) else None
             elif isinstance(s, P.IndexExprContext):
                 idx = self.visit(s.expression())
+                tipo = tipo.element_type if isinstance(tipo, ArrayType) else None
                 self.free(lugar, idx)
                 dst = self.temp()
-                self.emit(T.load_index(dst, lugar, idx))
+                self.emit(T.load_index(dst, lugar, idx), tipo)
                 lugar = dst
-                tipo = tipo.element_type if isinstance(tipo, ArrayType) else None
             else:  # llamada sobre el valor anterior (funcion como valor)
-                args = self._args(s.arguments())
+                args = self._args(s.arguments(), tipo)
                 ret = tipo.return_type if isinstance(tipo, FunctionType) else None
                 resultado = self._emit_llamada("callc", lugar, None, args, ret, liberar=(lugar,))
                 lugar, tipo = resultado, ret
@@ -840,7 +1051,7 @@ class TACGenerator(CompiscriptVisitor):
         return lugar, tipo
 
     def _llamada_por_nombre(self, sym: Symbol, nombre: str, llamada: P.CallExprContext):
-        args = self._args(llamada.arguments())
+        args = self._args(llamada.arguments(), sym.type)
         ret = sym.type.return_type if isinstance(sym.type, FunctionType) else None
         if sym.kind == "function":
             return self._emit_llamada("call", sym.label or nombre, None, args, ret), ret
@@ -849,8 +1060,8 @@ class TACGenerator(CompiscriptVisitor):
         return self._emit_llamada("callc", funcion, None, args, ret), ret
 
     def _llamada_metodo(self, receptor: str, tipo: Type | None, nombre: str, llamada: P.CallExprContext):
-        args = self._args(llamada.arguments())
         firma = tipo.lookup_member(nombre) if isinstance(tipo, ClassType) else None
+        args = self._args(llamada.arguments(), firma)
         ret = firma.return_type if isinstance(firma, FunctionType) else None
         layout = self.layouts.get(tipo.name) if isinstance(tipo, ClassType) else None
         definidor = layout.resolve_method(nombre) if layout is not None else None
@@ -864,7 +1075,7 @@ class TACGenerator(CompiscriptVisitor):
             self.emit(T.param(a))
         self.free(receptor, *args)
         dst = None if ret == VOID else self.temp()
-        self.emit(T.call(dst, destino, n, "callv"))
+        self.emit(T.call(dst, destino, n, "callv"), ret)
         return dst, ret
 
     # --- asignaciones como expresion -------------------------------
@@ -875,24 +1086,29 @@ class TACGenerator(CompiscriptVisitor):
         if not sufijos:
             sym = self.scope.resolve(lhs.primaryAtom().getText())
             destino = self._place(sym, ctx.start.line)
-            self.emit_assign(destino, self.visit(ctx.assignmentExpr()))
+            self.emit_assign(destino, self._visitar_como(ctx.assignmentExpr(), sym.type))
             return destino
-        base, _ = self._eval_lhs(lhs, len(sufijos) - 1)
+        base, tipo_base = self._eval_lhs(lhs, len(sufijos) - 1)
         ultimo = sufijos[-1]
         if isinstance(ultimo, P.IndexExprContext):
             idx = self.visit(ultimo.expression())
-            valor = self.visit(ctx.assignmentExpr())
+            elemento = tipo_base.element_type if isinstance(tipo_base, ArrayType) else None
+            valor = self._visitar_como(ctx.assignmentExpr(), elemento)
             self.emit(T.store_index(base, idx, valor))
             self.free(base, idx)
         else:
-            valor = self.visit(ctx.assignmentExpr())
-            self.emit(T.store_field(base, ultimo.Identifier().getText(), valor))
+            campo = ultimo.Identifier().getText()
+            clase, tipo_campo = self._campo(tipo_base, campo)
+            valor = self._visitar_como(ctx.assignmentExpr(), tipo_campo)
+            self.emit(T.store_field(base, campo, valor)).clase = clase
             self.free(base)
         return valor
 
     def visitPropertyAssignExpr(self, ctx: P.PropertyAssignExprContext):
         base = self.visit(ctx.lhs)
-        valor = self.visit(ctx.assignmentExpr())
-        self.emit(T.store_field(base, ctx.Identifier().getText(), valor))
+        campo = ctx.Identifier().getText()
+        clase, tipo_campo = self._campo(self._tipo_lugar(base), campo)
+        valor = self._visitar_como(ctx.assignmentExpr(), tipo_campo)
+        self.emit(T.store_field(base, campo, valor)).clase = clase
         self.free(base)
         return valor

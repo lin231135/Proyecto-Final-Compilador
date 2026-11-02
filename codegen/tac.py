@@ -27,9 +27,16 @@ Cada instruccion es un `Instr(op, ...)`; `str(instr)` da su forma textual.
     load_index    dst, arr, idx               dst = arr[idx]
     store_index   arr, idx, a                 arr[idx] = a
     closure       dst, label                  dst = closure f
+    itof          dst, a                      dst = itof a
     try           name                        try L1
     endtry        -                           endtry
     catch         dst                         catch e
+
+Ademas de la forma textual, cada `Instr` lleva dos anotaciones que NO se
+imprimen y que consume el back-end (`backend/`):
+    ty     tipo (core.types) del valor que define la instruccion; en la
+           llamada a `print`, el tipo del argumento.
+    clase  clase estatica del objeto en load_field/store_field.
 """
 
 from __future__ import annotations
@@ -39,6 +46,16 @@ from dataclasses import dataclass, field
 
 _TEMP_RE = re.compile(r"^t\d+$")
 _TEMP_USE_RE = re.compile(r"^t(\d+)(?:\.|$)")
+_ESCAPE_RE = re.compile(r"\\(.)", re.S)
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+
+
+def unescape(literal: str) -> str:
+    """Texto real de un literal de string del fuente (con sus comillas).
+
+    Una sola pasada, asi una barra escapada seguida de `n` no se confunde con
+    un salto de linea. Una secuencia desconocida vale el caracter escapado."""
+    return _ESCAPE_RE.sub(lambda m: _ESCAPES.get(m.group(1), m.group(1)), literal[1:-1])
 
 
 def is_temp(place: str | None) -> bool:
@@ -48,7 +65,7 @@ def is_temp(place: str | None) -> bool:
 # Instrucciones que definen (escriben) `dst`; el peephole de `emit_assign`
 # solo puede redirigir el destino de estas.
 DEFINING_OPS = frozenset(
-    {"copy", "bin", "un", "call", "callv", "callc", "newlist", "len", "load_field", "load_index", "closure"}
+    {"copy", "bin", "un", "call", "callv", "callc", "newlist", "len", "load_field", "load_index", "closure", "itof"}
 )
 
 
@@ -62,6 +79,9 @@ class Instr:
     name: str | None = None  # etiqueta, clase, campo o destino de llamada
     n: int | None = None
     c: str | None = None  # tercer operando (valor de store_index)
+    ty: object | None = None  # tipo del valor definido (no se imprime; ver arriba)
+    clase: str | None = None  # clase estatica de load_field/store_field (no se imprime)
+    args: list[str] | None = None  # argumentos de una llamada (solo en backend/)
 
     def __str__(self) -> str:  # noqa: C901 - tabla de formatos
         o = self.op
@@ -104,6 +124,8 @@ class Instr:
             return f"{self.a}[{self.b}] = {self.c}"
         if o == "closure":
             return f"{self.dst} = closure {self.name}"
+        if o == "itof":
+            return f"{self.dst} = itof {self.a}"
         if o == "try":
             return f"try {self.name}"
         if o == "endtry":
@@ -188,6 +210,10 @@ def store_index(arr, idx, valor):
 
 def closure(dst, label_):
     return Instr("closure", dst=dst, name=label_)
+
+
+def itof(dst, a):
+    return Instr("itof", dst=dst, a=a)
 
 
 # Inversion de relacionales para `ifFalse` fusionado: !(a < b) == (a >= b)

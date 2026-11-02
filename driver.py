@@ -14,6 +14,7 @@ lexer/parser/visitor de ANTLR por su cuenta.
 from __future__ import annotations
 
 import pathlib
+import sys
 from dataclasses import dataclass, field
 
 from antlr4 import CommonTokenStream, InputStream
@@ -27,6 +28,9 @@ from generated.CompiscriptLexer import CompiscriptLexer
 from generated.CompiscriptParser import CompiscriptParser
 from semantico.prepass import ejecutar_prepass
 from semantico.visitor import SemanticVisitor
+
+
+LIMITE_RECURSION = 50_000
 
 
 class _ListenerDeErrores(ErrorListener):
@@ -71,6 +75,10 @@ class Resultado:
 
 
 def analizar(fuente: str, nombre: str = "<memoria>", generar: bool = True) -> Resultado:
+    # Cada nivel de parentesis baja por toda la cadena de precedencia de la
+    # gramatica (unas 13 reglas): el limite por defecto no alcanza para una
+    # expresion anidada unas 30 veces.
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), LIMITE_RECURSION))
     errores_sintacticos: list[SemanticError] = []
 
     lexer = CompiscriptLexer(InputStream(fuente))
