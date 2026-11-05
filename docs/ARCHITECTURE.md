@@ -1,10 +1,11 @@
 # Arquitectura del compilador
 
-Compilador de **Compiscript** (subconjunto de TypeScript) que produce código
-intermedio de tres direcciones (TAC). Continúa el proyecto anterior
-(analizador léxico, sintáctico y semántico) y agrega la generación de código
-intermedio, el manejo de temporales y la tabla de símbolos extendida con
-registros de activación.
+Compilador de **Compiscript** (subconjunto de TypeScript) que produce ensamblador
+MIPS32 y AArch64 pasando por código intermedio de tres direcciones (TAC). Reúne las
+tres fases del proyecto: análisis léxico, sintáctico y semántico; código intermedio,
+temporales y tabla de símbolos extendida; y generación de código final, con secuencias
+de llamada y asignación de registros. El detalle de esta última fase está en
+[Generacion_Codigo.md](Generacion_Codigo.md).
 
 ## 1. Flujo
 
@@ -31,18 +32,30 @@ registros de activación.
                       │
      TAC (codegen/tac.py)  +  tabla de símbolos extendida (codegen/report.py)
                       │
+        ┌─────────────▼──────────────┐
+  (4)   │ backend/                          CFG, liveness y next-use (cfg.py)
+        │   · secuencias de llamada         getReg y descriptores (regalloc.py)
+        │   · asignación de registros       traducción común (generador.py)
+        │   · traducción de cada instr.     MIPS32 (mips.py) · AArch64 (aarch64.py)
+        └─────────────┬──────────────┘      → error de back-end si no se puede traducir
+                      │
+              ensamblador + runtime
+                      │
+  (5)   simulador/   interno (MIPS y AArch64) · MARS · SPIM · nativo en la Raspberry
+                      │
         CLI (main.py)  ·  IDE (ide/app.py)  ·  batería (pruebas/runner.py)
 ```
 
 `driver.analizar(fuente)` ejecuta (1)–(3) y devuelve un `Resultado` con los
 errores, el árbol, la tabla, el TAC y el generador. Es el **único** punto de
 entrada: el IDE, la CLI y las pruebas lo usan; nadie más instancia
-lexer/parser/visitor.
+lexer/parser/visitor. `backend.generar_ensamblador(resultado, target)` hace (4) y
+`simulador.ejecucion.ejecutar_codigo(codigo, target, medio)` hace (5).
 
 ## 2. Estructura del repositorio
 
 ```
-main.py                CLI (python main.py archivo.cps [--symbols|--tac-only]); sin args abre el IDE
+main.py                CLI (TAC, ensamblador, ejecucion); sin args abre el IDE
 driver.py              analizar(fuente) -> Resultado   (pipeline completo)
 build_grammar.py       regenera generated/ desde grammar/Compiscript.g4
 
@@ -54,6 +67,7 @@ core/                  contrato compartido
   symbols.py             Symbol / Scope / SymbolTable  (con los campos de codegen)
   memory.py              tamaños, ActivationRecord, ClassLayout   ← tabla de símbolos extendida
   errors.py              SemanticError / ErrorReporter
+  runtime.py             contrato de ejecucion: enteros de 32 bits, formato de float, mensajes
 
 semantico/             análisis semántico (Visitor de ANTLR, un mixin por área)
   prepass.py             pasada 1: funciones globales y clases por adelantado
@@ -67,8 +81,21 @@ codegen/               generación de código intermedio
   tac.py                 instrucciones TAC, TempManager (reciclaje), TACFunction/TACProgram
   generator.py           TACGenerator: el Visitor que traduce
   report.py              reporte de la tabla de símbolos extendida (AR, layout, closures)
-  interpreter.py         simulador de TAC (solo para validar con la batería)
+  interpreter.py         simulador de TAC: la referencia con la que se comparan los back-ends
 
+backend/               generación de código final
+  cfg.py                 bloques básicos, CFG, liveness, next-use
+  regalloc.py            getReg, descriptores, variables fijas en registros
+  generador.py           análisis del programa y traducción de cada instrucción
+  target.py              interfaz con el procesador destino
+  mips.py, mips_runtime.py          MIPS32
+  aarch64.py, aarch64_runtime.py    AArch64 (Raspberry Pi 4)
+
+simulador/             ejecución del ensamblador
+  mips.py, aarch64.py    simuladores en Python, con verificación de la convención de llamada
+  ejecucion.py           interno, MARS, SPIM o nativo, con la misma interfaz
+
+scripts/               probar_en_raspberry.sh
 arbol/                 árbol sintáctico → imagen (Graphviz) para el IDE
 ide/app.py             IDE (CustomTkinter)
 pruebas/               batería .cps (válidos/inválidos) + runner
@@ -123,6 +150,11 @@ asignar `ctx.scope` y el generador entrar a él con `_entrar`.
 | Temporales y reciclaje | `tests/test_codegen_temporales.py` |
 | Tabla de símbolos, AR, layout | `tests/test_codegen_simbolos.py` |
 | Ejecución del TAC en el simulador (resultados correctos) | `tests/test_codegen_ejecucion.py` |
+| Cada programa válido de la batería se ejecuta en MIPS y AArch64 e imprime lo mismo que el TAC | `pruebas/` + `pruebas/runner.py` |
+| CFG, liveness, next-use, `getReg`, prólogo y epílogo | `tests/test_backend.py` |
+| Programas aleatorios en TAC, MIPS y AArch64; mutación del derrame de registros | `tests/test_diferencial.py`, `tests/generador_programas.py` |
+| Los simuladores rechazan lo que una máquina real rechaza | `tests/test_simuladores.py` |
+| Errores de las fases 1 y 2 hallados al generar código real | `tests/test_regresiones.py` |
 | CLI y pipeline | `tests/test_cli.py`, `tests/test_driver.py` |
 | La documentación coincide con el compilador | `tests/test_docs.py` |
 | Análisis semántico (tipos, ámbitos, funciones, clases) | `tests/test_tipos.py`, `test_funciones.py`, `test_clases.py`, `test_symbols.py`, `test_mixins.py` |
@@ -141,7 +173,25 @@ el front-end, todos con prueba:
 - Herencia cíclica reportada como error (antes colgaba el análisis).
 - Strings con secuencias de escape (`\"`) en la gramática.
 
-## 7. Limitaciones conocidas
+## 7. Cambios en la fase de generación de código
+
+Generar código real exigió completar las fases anteriores (cada cambio tiene prueba
+en `tests/test_regresiones.py`):
+
+- El TAC lleva tipos anotados (`Instr.ty`, `Instr.clase`), invisibles en su forma
+  impresa, y la conversión `itof` explícita.
+- `break`, `continue` y `return` dentro de `try` emiten `endtry`.
+- Una variable llamada `t1` ya no se confunde con el temporal `t1`, y una función
+  llamada `main` ya no choca con el programa principal.
+- Una función anidada en un método se puede llamar y ve `this` por el enlace de acceso.
+- `let d = null;` anota lo que recibe (`Symbol.tipo_asignado`) y los parámetros sin
+  anotación se deducen de sus llamadas.
+- El simulador de TAC sigue el contrato de `core/runtime.py`: enteros de 32 bits,
+  división truncada, objetos comparados por identidad, valores por defecto y errores de
+  ejecución definidos.
+- Una expresión muy anidada ya no agota la recursión de Python.
+
+## 8. Limitaciones conocidas
 
 - El lenguaje no tiene tipos de función en las anotaciones: una función no puede
   devolverse desde otra (sí funcionan las funciones anidadas con acceso al
@@ -150,3 +200,5 @@ el front-end, todos con prueba:
   de rango).
 - El TAC no tiene optimizaciones más allá del reciclaje de temporales y de las
   fusiones descritas.
+- Las limitaciones del back-end están en
+  [Generacion_Codigo.md](Generacion_Codigo.md#11-limitaciones).

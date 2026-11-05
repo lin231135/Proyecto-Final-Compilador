@@ -56,6 +56,7 @@ izquierdo y operando derecho).
 | `x = y` | copia |
 | `x = a op b` | operación binaria. `op` ∈ `+ - * / %` (aritméticas, `+` también concatena strings) y `== != < <= > >=` (producen boolean) |
 | `x = - a`  /  `x = ! a` | negación aritmética / lógica |
+| `x = itof a` | convierte un `integer` a `float` (operación mixta, asignación a `float`) |
 | `L:` | etiqueta |
 | `goto L` | salto incondicional |
 | `if a goto L` | salta si `a` es verdadero |
@@ -323,6 +324,10 @@ L1:
 L2:
 endfunc
 ```
+
+Toda salida del bloque `try` retira su manejador: además del `endtry` del final, un
+`break`, `continue` o `return` dentro del bloque emite su propio `endtry` antes de
+saltar.
 
 ### 4.11 Funciones: definición, parámetros, llamada y retorno
 
@@ -625,9 +630,12 @@ Reglas adicionales:
    generador asume un programa bien tipado (reglas de tipos, ámbitos, aridad,
    herencia no cíclica, etc. ya comprobadas) y reutiliza el árbol, los `Scope`
    y los tipos del análisis.
-2. **Sin tipos en el TAC.** Los tipos se usan al generar (tamaños, resolución
-   de métodos) pero no aparecen en las instrucciones. Los enteros y flotantes
-   comparten los operadores; `/` entre enteros es división entera.
+2. **Sin tipos en el texto del TAC.** Los tipos no aparecen en la forma impresa
+   de las instrucciones, pero cada `Instr` lleva anotado el tipo del valor que
+   define (`ty`) y la clase del objeto en los accesos a campos (`clase`): los usa
+   el back-end. Enteros y flotantes comparten los operadores y la conversión
+   `integer` → `float` es explícita (`itof`); un literal se convierte al generar
+   (`let f: float = 1;` da `@f = 1.0`). `/` entre enteros trunca hacia cero.
 3. **Operandos simbólicos, memoria en la tabla de símbolos.** El TAC nombra
    variables; sus desplazamientos y tamaños están en la tabla de símbolos
    extendida (`--symbols`). Así el TAC es legible y un back-end puede traducir
@@ -644,8 +652,9 @@ Reglas adicionales:
    comparación usa `==` y `break` es válido dentro de un `switch`. `continue`
    solo es válido en bucles.
 8. **`try/catch`**: el lenguaje no tiene `throw`; el error que se captura es el
-   que produce la ejecución (por ejemplo un índice fuera de rango). La variable
-   del `catch` es un string.
+   que produce la ejecución (`indice fuera de rango`, `division entre cero`,
+   `acceso a null`, ver `core/runtime.py`). La variable del `catch` es un string.
+   Un error sin `catch` termina el programa con código 1.
 9. **Valores-función**: una función puede guardarse en una variable o pasarse
    como argumento (`closure`/`callc`). Como el lenguaje no tiene tipos de
    función en las anotaciones, una función no puede *devolverse* desde otra
@@ -661,9 +670,11 @@ Reglas adicionales:
 
 `codegen/interpreter.py` ejecuta el TAC (marcos con enlace de acceso, área
 estática, objetos, listas, closures, despacho virtual, `try/catch`) y devuelve
-lo que imprime el programa. No es un back-end: sirve para que la batería de
-pruebas compruebe que la traducción es **correcta** (`// @salida:`), y está
-disponible en el IDE con el botón *Ejecutar TAC*.
+lo que imprime el programa. No es un back-end: es la referencia con la que la
+batería comprueba que la traducción es **correcta** (`// @salida:`) y que el
+ensamblador imprime lo mismo, y está disponible en el IDE con el botón
+*Ejecutar TAC*. Sigue el contrato de `core/runtime.py`: enteros de 32 bits,
+división truncada, formato de `float` y mensajes de error.
 
 ```bash
 python main.py programa.cps              # TAC

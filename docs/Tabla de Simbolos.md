@@ -205,13 +205,14 @@ AR f.g  (profundidad 2, AR lexico padre = f, tamano 32 B)
 
 ## 9. Simplificaciones
 
-- El modelo de memoria es didáctico (tamaños fijos, sin ABI de una arquitectura
-  real): no se genera código de máquina.
-- Los AR de funciones con closures se modelan como si pudieran sobrevivir a la
-  llamada; en un back-end real habría que alojarlos en el heap si una función
-  se devolviera como valor (el lenguaje actual no lo permite, ver
-  [supuesto 9](Lenguaje_Intermedio_TAC.md#7-supuestos-y-decisiones-de-diseño)).
+- Los tamaños son fijos y no siguen la ABI de un procesador: una referencia
+  ocupa 8 bytes también en MIPS, donde se usan 4. A cambio, los desplazamientos
+  de esta tabla se usan tal cual en el ensamblador de los dos procesadores
+  ([Generación de código](Generacion_Codigo.md#2-representación-de-los-datos)).
+- Los AR de funciones que crean closures de funciones anidadas se reservan en
+  el heap, porque el closure puede sobrevivir a la llamada
+  ([Generación de código](Generacion_Codigo.md#7-closures-y-enlaces-de-acceso)).
 - No se reutilizan las ranuras de variables de bloques ya cerrados.
-- El reporte imprime los tamaños de los registros, pero no hay un
-  planificador/asignador de registros de CPU (queda para la fase de código
-  objeto).
+- La ranura de un valor que vive en un registro queda sin usar, salvo como
+  destino de un derrame
+  ([asignación de registros](Generacion_Codigo.md#5-asignación-de-registros)).

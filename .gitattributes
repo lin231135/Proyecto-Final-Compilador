@@ -1,0 +1,4 @@
+# Los scripts y el ensamblador se usan en Linux (Raspberry Pi): siempre con LF.
+*.sh text eol=lf
+*.s text eol=lf
+*.asm text eol=lf
