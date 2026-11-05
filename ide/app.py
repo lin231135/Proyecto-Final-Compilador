@@ -1,14 +1,15 @@
 """
 IDE de Compiscript (CustomTkinter + Tk) con estilo oscuro tipo Visual Studio Code.
 
-Escribir/abrir un .cps, compilarlo y ver el codigo intermedio (TAC), los
-problemas, la tabla de simbolos extendida (direcciones, registros de
-activacion), la salida del programa, el arbol sintactico y la bateria de
-pruebas. Los paneles se alimentan de `driver.Resultado`; la compilacion NO se
-reimplementa aqui.
+Escribir/abrir un .cps, compilarlo y ver el codigo intermedio (TAC), el
+ensamblador (MIPS32 o AArch64), la asignacion de registros, los problemas, la
+tabla de simbolos extendida (direcciones, registros de activacion), la salida
+del programa, el arbol sintactico y la bateria de pruebas. Los paneles se
+alimentan de `driver.Resultado`; la compilacion NO se reimplementa aqui.
 
-Atajos: F5 compilar, F6 ejecutar el TAC, F7 correr la bateria, Ctrl+S guardar,
-Ctrl+O abrir, Ctrl+/ comentar, Ctrl+rueda o Ctrl +/- para el zoom.
+Atajos: F5 compilar, F6 ejecutar el TAC, F7 correr la bateria, F8 ejecutar el
+ensamblador, Ctrl+S guardar, Ctrl+O abrir, Ctrl+/ comentar, Ctrl+rueda o
+Ctrl +/- para el zoom.
 """
 
 from __future__ import annotations
@@ -25,10 +26,12 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 from arbol.ast_graphviz import dot_disponible, render_png, render_texto
+from backend import BackendError, Ensamblado, generar_ensamblador
 from codegen.interpreter import ejecutar
 from codegen.report import render_codegen_report
 from driver import Resultado, analizar
-from pruebas.runner import ejecutar_bateria
+from pruebas.runner import ERRORES_DE_EJECUCION, ejecutar_bateria
+from simulador.ejecucion import ejecutar_codigo, medios_disponibles
 
 ctk.set_appearance_mode("dark")
 
@@ -75,7 +78,10 @@ CONSTANTES = {"true", "false", "null"}
 
 TAC_CTRL = {"goto", "if", "ifFalse", "return"}
 TAC_KW = {"func", "endfunc", "param", "call", "callv", "callc", "new", "newlist", "len", "closure",
-          "try", "endtry", "catch"}
+          "itof", "try", "endtry", "catch"}
+
+# Opciones del selector de procesador: texto -> nombre en backend/.
+PROCESADORES = {"MIPS32": "mips", "ARM64 (Raspberry Pi 4)": "arm64"}
 
 RE_FUENTE = re.compile(
     r'(?P<comentario>//[^\n]*|/\*.*?\*/)'
@@ -96,7 +102,18 @@ RE_TAC = re.compile(
     re.M,
 )
 
-EJEMPLO = '''// Compiscript: escriba aqui y presione F5 para compilar, F6 para ejecutar el TAC
+RE_ASM = re.compile(
+    r'(?P<comentario>(?:#|//)[^\n]*)'
+    r'|(?P<cadena>"(?:[^"\\\n]|\\.)*")'
+    r'|(?P<etiqueta>^[\w.]+:)'
+    r'|(?P<directiva>^\s*\.\w+|(?<=: )\.\w+)'
+    r'|(?P<registro>\$\w+|\b[xwd]\d+\b|\b(?:sp|xzr|wzr)\b)'
+    r'|(?P<numero>#?-?\b\d+(?:\.\d+)?\b)'
+    r'|(?P<instruccion>^\s+[a-z][a-z0-9.]*)',
+    re.M,
+)
+
+EJEMPLO = '''// Compiscript: F5 compila, F6 ejecuta el TAC y F8 ejecuta el ensamblador
 class Animal {
   let nombre: string;
   function constructor(nombre: string) { this.nombre = nombre; }
@@ -126,12 +143,13 @@ class CompiscriptIDE(ctk.CTk):
         super().__init__()
         self.title("Compiscript IDE")
         self._centrar_ventana(1440, 900)
-        self.minsize(960, 640)
+        self.minsize(1100, 640)
         self.configure(fg_color=BG)
 
         self.ruta_actual: pathlib.Path | None = None
         self.modificado = False
         self.resultado: Resultado | None = None
+        self.ensamblado: Ensamblado | None = None
         self.lineas_error: set[int] = set()
         self._imagen_arbol_pil: Image.Image | None = None
         self._imagen_arbol_tk: ImageTk.PhotoImage | None = None
@@ -233,6 +251,9 @@ class CompiscriptIDE(ctk.CTk):
                     negrita=True).pack(side="left", pady=7)
         tk.Frame(barra, bg=BG_BARRA, width=6).pack(side="left")
         self._boton(barra, "⚙  Ejecutar TAC  F6", self.ejecutar_tac, bg=AZUL, fg="#ffffff",
+                    hover="#1a8ad4", negrita=True).pack(side="left", pady=7)
+        tk.Frame(barra, bg=BG_BARRA, width=6).pack(side="left")
+        self._boton(barra, "⚡  Ejecutar asm  F8", self.ejecutar_ensamblador, bg=AZUL, fg="#ffffff",
                     hover="#1a8ad4", negrita=True).pack(side="left", pady=7)
         tk.Frame(barra, bg=BG_BARRA, width=6).pack(side="left")
         self._boton(barra, "✔  Batería  F7", self.correr_bateria).pack(side="left", pady=5)
@@ -411,7 +432,8 @@ class CompiscriptIDE(ctk.CTk):
         self.tabs.pack(fill="both", expand=True)
 
         self.pestanas: dict[str, tk.Frame] = {}
-        for clave, titulo in (("tac", "CÓDIGO INTERMEDIO (TAC)"), ("problemas", "PROBLEMAS"),
+        for clave, titulo in (("tac", "CÓDIGO INTERMEDIO (TAC)"), ("asm", "ENSAMBLADOR"),
+                              ("registros", "REGISTROS"), ("problemas", "PROBLEMAS"),
                               ("simbolos", "TABLA DE SÍMBOLOS"), ("salida", "SALIDA"),
                               ("arbol", "ÁRBOL SINTÁCTICO"), ("bateria", "BATERÍA")):
             frame = tk.Frame(self.tabs, bg=BG)
@@ -421,12 +443,35 @@ class CompiscriptIDE(ctk.CTk):
         self.texto_tac = self._texto_con_scroll(self.pestanas["tac"])
         self._escribir(self.texto_tac, "Presione F5 para compilar el programa y ver el código intermedio.", "tenue")
 
+        self._construir_barra_ensamblador()
+        self.texto_asm = self._texto_con_scroll(self.pestanas["asm"])
+        self._escribir(self.texto_asm, "Presione F5 para compilar y generar el ensamblador.", "tenue")
+        self.texto_registros = self._texto_con_scroll(self.pestanas["registros"])
+
         self._construir_problemas()
         self.texto_tabla = self._texto_con_scroll(self.pestanas["simbolos"])
         self.texto_salida = self._texto_con_scroll(self.pestanas["salida"])
         self._construir_arbol()
         self.texto_bateria = self._texto_con_scroll(self.pestanas["bateria"])
         return marco
+
+    def _construir_barra_ensamblador(self) -> None:
+        """Procesador destino y donde ejecutar: arriba de la pestana ENSAMBLADOR."""
+        barra = tk.Frame(self.pestanas["asm"], bg=BG_LATERAL)
+        barra.pack(side="top", fill="x")
+        tk.Label(barra, text="Procesador", bg=BG_LATERAL, fg=TEXTO_TENUE, font=self.f_ui).pack(side="left", padx=(10, 6))
+        self.menu_procesador = ctk.CTkOptionMenu(
+            barra, values=list(PROCESADORES), width=200, height=26, fg_color=BG_TAB, button_color=BORDE,
+            command=lambda _v: self._cambiar_procesador(),
+        )
+        self.menu_procesador.pack(side="left", pady=4)
+        tk.Label(barra, text="Ejecutar en", bg=BG_LATERAL, fg=TEXTO_TENUE, font=self.f_ui).pack(side="left", padx=(14, 6))
+        self.menu_medio = ctk.CTkOptionMenu(
+            barra, values=["interno"], width=100, height=26, fg_color=BG_TAB, button_color=BORDE,
+        )
+        self.menu_medio.pack(side="left", pady=4)
+        self._boton(barra, "Guardar ensamblador", self.guardar_ensamblador, bg=BG_LATERAL).pack(side="right", padx=6)
+        self._cambiar_procesador(recompilar=False)
 
     def _construir_problemas(self) -> None:
         contenedor = tk.Frame(self.pestanas["problemas"], bg=BG)
@@ -472,6 +517,7 @@ class CompiscriptIDE(ctk.CTk):
         self.bind("<F5>", lambda _e: self.compilar())
         self.bind("<F6>", lambda _e: self.ejecutar_tac())
         self.bind("<F7>", lambda _e: self.correr_bateria())
+        self.bind("<F8>", lambda _e: self.ejecutar_ensamblador())
         self.bind("<Control-Return>", lambda _e: self.compilar())
         self.bind("<Control-s>", lambda _e: self.guardar_archivo())
         self.bind("<Control-o>", lambda _e: self.abrir_archivo())
@@ -562,6 +608,18 @@ class CompiscriptIDE(ctk.CTk):
         if palabra in TAC_KW:
             return "kw"
         return None
+
+    @staticmethod
+    def _clasificar_asm(m: re.Match, _texto: str) -> str | None:
+        return {
+            "comentario": "comentario",
+            "cadena": "cadena",
+            "etiqueta": "etiqueta",
+            "directiva": "kw",
+            "registro": "temp",
+            "numero": "numero",
+            "instruccion": "funcion",
+        }[m.lastgroup]
 
     def _resaltar(self, widget: tk.Text, patron: re.Pattern, clasificar) -> None:
         texto = widget.get("1.0", "end-1c")
@@ -731,6 +789,7 @@ class CompiscriptIDE(ctk.CTk):
         fuente = self.editor.get("1.0", "end-1c")
         self.resultado = analizar(fuente, nombre=str(self.ruta_actual) if self.ruta_actual else "<memoria>")
         self._pintar_tac()
+        self._generar_ensamblador()
         self._pintar_errores()
         self._pintar_tabla()
         self._pintar_arbol()
@@ -753,6 +812,75 @@ class CompiscriptIDE(ctk.CTk):
                 "El generador solo corre cuando el análisis no reporta errores (ver pestaña PROBLEMAS).",
                 "fallo",
             )
+
+    @property
+    def procesador(self) -> str:
+        return PROCESADORES[self.menu_procesador.get()]
+
+    def _cambiar_procesador(self, recompilar: bool = True) -> None:
+        medios = medios_disponibles(self.procesador)
+        self.menu_medio.configure(values=medios)
+        self.menu_medio.set(medios[-1] if self.procesador == "arm64" else medios[0])
+        if recompilar and self.resultado is not None:
+            self._generar_ensamblador()
+
+    def _generar_ensamblador(self) -> None:
+        """Traduce el TAC al procesador elegido y llena sus dos pestanas."""
+        self.ensamblado = None
+        r = self.resultado
+        if r is None or r.tac is None:
+            self._escribir(self.texto_asm, "No se generó ensamblador: corrija los problemas primero.", "fallo")
+            self._escribir(self.texto_registros, "")
+            return
+        try:
+            self.ensamblado = generar_ensamblador(r, self.procesador)
+        except BackendError as error:
+            self._escribir(self.texto_asm, f"Error de generación de código:\n{error}", "fallo")
+            self._escribir(self.texto_registros, "")
+            return
+        self._escribir(self.texto_asm, self.ensamblado.codigo)
+        self._resaltar(self.texto_asm, RE_ASM, self._clasificar_asm)
+        reporte = self.ensamblado.reporte()
+        if self.ensamblado.avisos:
+            reporte = "\n".join(f"Aviso: {a}" for a in self.ensamblado.avisos) + "\n\n" + reporte
+        self._escribir(self.texto_registros, reporte)
+
+    def ejecutar_ensamblador(self) -> None:
+        """Compila y ejecuta el ensamblador en el medio elegido."""
+        self.compilar()
+        if self.ensamblado is None:
+            self._seleccionar_pestana("asm" if self.resultado and self.resultado.ok else "problemas")
+            return
+        medio = self.menu_medio.get()
+        try:
+            ejecucion = ejecutar_codigo(self.ensamblado.codigo, self.procesador, medio)
+        except ERRORES_DE_EJECUCION as error:
+            self._escribir(self.texto_salida, f"No se pudo ejecutar el ensamblador:\n{error}", "fallo")
+            self._estado("  Error al ejecutar", ROJO)
+            self._seleccionar_pestana("salida")
+            return
+        titulo = f"▶ Salida del programa ({self.menu_procesador.get()}, {ejecucion.medio})\n\n"
+        self._escribir(self.texto_salida, titulo, "titulo")
+        self._escribir(self.texto_salida, ejecucion.salida or "(el programa no imprimió nada)",
+                       None if ejecucion.salida else "tenue", limpiar=False)
+        if ejecucion.instrucciones is not None:
+            detalle = f"\n\n{ejecucion.instrucciones} instrucciones, {ejecucion.pila_maxima} bytes de pila"
+            self._escribir(self.texto_salida, detalle, "tenue", limpiar=False)
+        self._estado(f"  Terminó con código {ejecucion.codigo_salida}", VERDE if ejecucion.codigo_salida == 0 else ROJO)
+        self._seleccionar_pestana("salida")
+
+    def guardar_ensamblador(self) -> None:
+        self.compilar()
+        if self.ensamblado is None:
+            self._seleccionar_pestana("asm" if self.resultado and self.resultado.ok else "problemas")
+            return
+        extension = ".asm" if self.procesador == "mips" else ".s"
+        ruta = filedialog.asksaveasfilename(
+            defaultextension=extension, filetypes=[("Ensamblador", f"*{extension}"), ("Todos", "*.*")]
+        )
+        if ruta:
+            pathlib.Path(ruta).write_text(self.ensamblado.codigo, encoding="utf-8", newline="\n")
+            self._estado(f"  Guardado en {ruta}", VERDE)
 
     def ejecutar_tac(self) -> None:
         """Corre el TAC con el simulador y muestra lo que imprime el programa."""
