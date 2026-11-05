@@ -5,9 +5,12 @@ archivo .cps de la bateria, mas los 2 chequeos dedicados de pruebas/demo/.
 
 import pytest
 
+from backend import generar_ensamblador
+from codegen.interpreter import ejecutar
 from core.errors import CATEGORIAS
 from driver import analizar_archivo
 from pruebas.runner import RAIZ, ejecutar_bateria
+from simulador.ejecucion import ejecutar_codigo
 
 RESULTADOS = ejecutar_bateria()
 
@@ -22,7 +25,21 @@ def test_bateria(resultado):
 
 
 def test_bateria_no_esta_vacia():
-    assert len(RESULTADOS) >= 95
+    assert len(RESULTADOS) >= 140
+
+
+def test_bateria_cubre_casos_validos_e_invalidos_de_generacion_de_codigo():
+    asm = [r for r in RESULTADOS if r.archivo.parent.parent.name.startswith("asm_")]
+    assert sum(r.es_valido for r in asm) >= 35
+    assert sum(not r.es_valido for r in asm) >= 5
+
+
+def test_demo_programa_completo_se_ejecuta_igual_en_tac_mips_y_arm():
+    r = analizar_archivo(RAIZ / "demo" / "programa_completo.cps")
+    esperada = "".join(linea + "\n" for linea in ejecutar(r))
+    for target in ("mips", "arm64"):
+        codigo = generar_ensamblador(r, target).codigo
+        assert ejecutar_codigo(codigo, target, "interno").salida == esperada
 
 
 def test_demo_programa_completo_sin_errores():

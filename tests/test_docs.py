@@ -31,6 +31,27 @@ def test_ejemplo_del_documento_coincide_con_el_compilador(fuente, esperado):
 
 
 DOC_SIMBOLOS = DOC.parent / "Tabla de Simbolos.md"
+DOC_GENERACION = DOC.parent / "Generacion_Codigo.md"
+
+
+def test_ejemplo_de_ensamblador_coincide_con_el_compilador():
+    from backend import generar_ensamblador
+
+    texto = DOC_GENERACION.read_text(encoding="utf-8")
+    m = re.search(r"```cps\n([^`]*?)\n```\s*```mips\n(.*?)\n```", texto, re.S)
+    assert m, "falta el ejemplo ```cps/```mips en Generacion_Codigo.md"
+    ensamblado = generar_ensamblador(analizar(m.group(1)))
+    programa = ensamblado.codigo.splitlines()[: ensamblado.lineas_programa]
+    assert "\n".join(programa) == m.group(2)
+
+
+def test_reporte_de_registros_del_documento_coincide_con_el_compilador():
+    from backend import generar_ensamblador
+
+    texto = DOC_GENERACION.read_text(encoding="utf-8")
+    fuente = re.search(r"```cps\n([^`]*?)\n```\s*```mips", texto, re.S).group(1)
+    reporte = re.search(r"```regs\n(.*?)\n```", texto, re.S).group(1)
+    assert generar_ensamblador(analizar(fuente)).reporte() == reporte
 
 
 def test_reporte_de_simbolos_del_documento_coincide_con_el_compilador():

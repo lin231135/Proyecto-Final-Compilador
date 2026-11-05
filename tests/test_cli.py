@@ -40,6 +40,58 @@ def test_cli_symbols_agrega_tabla_y_registros_de_activacion(tmp_path, capsys):
     assert "AR f" in salida
 
 
+def test_cli_escribe_ensamblador_en_un_archivo(tmp_path, capsys):
+    ruta = escribir(tmp_path, "print(1);")
+    salida = tmp_path / "p.asm"
+    assert main([ruta, "-o", str(salida)]) == 0
+    assert "main:" in salida.read_text(encoding="utf-8")
+
+
+def test_cli_asm_imprime_mips_por_defecto(tmp_path, capsys):
+    assert main([escribir(tmp_path, "print(1);"), "--asm"]) == 0
+    assert "syscall" in capsys.readouterr().out
+
+
+def test_cli_target_arm64(tmp_path, capsys):
+    assert main([escribir(tmp_path, "print(1);"), "--asm", "--target", "arm64"]) == 0
+    assert "_start:" in capsys.readouterr().out
+
+
+def test_cli_run_ejecuta_el_programa(tmp_path, capsys):
+    assert main([escribir(tmp_path, "print(2 + 3);"), "--run", "--simulador", "interno"]) == 0
+    assert capsys.readouterr().out == "5\n"
+
+
+def test_cli_run_devuelve_el_codigo_del_programa(tmp_path, capsys):
+    ruta = escribir(tmp_path, "print(1 / 0);")
+    assert main([ruta, "--run", "--simulador", "interno"]) == 1
+    assert "division entre cero" in capsys.readouterr().out
+
+
+def test_cli_regs_muestra_el_reporte(tmp_path, capsys):
+    assert main([escribir(tmp_path, "print(1);"), "--regs"]) == 0
+    assert "TOTAL getReg" in capsys.readouterr().out
+
+
+def test_cli_con_errores_no_genera_ensamblador(tmp_path, capsys):
+    salida = tmp_path / "p.asm"
+    assert main([escribir(tmp_path, 'let a: integer = "x";'), "-o", str(salida)]) == 1
+    assert not salida.exists()
+
+
+def test_cli_reporta_error_del_backend(tmp_path, capsys):
+    ruta = escribir(tmp_path, 'function m(x) { print(x); } m(1); m("a");')
+    assert main([ruta, "--asm"]) == 1
+    assert "Error de generacion de codigo" in capsys.readouterr().out
+
+
+def test_cli_simulador_no_disponible_se_reporta(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("MARS_JAR", raising=False)
+    monkeypatch.setattr("simulador.ejecucion.buscar_mars", lambda: None)
+    assert main([escribir(tmp_path, "print(1);"), "--run", "--simulador", "mars"]) == 1
+    assert "No se pudo ejecutar" in capsys.readouterr().out
+
+
 def test_error_sintactico_se_reporta_con_linea_y_no_hay_tac():
     r = analizar("let x: integer = 3\nprint(x);")
     assert r.errores and r.errores[0].line == 2
