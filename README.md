@@ -62,6 +62,10 @@ python pruebas/runner.py --simulador mars   # batería con MARS
 python -m pytest -q                         # todas las pruebas
 ```
 
+Para ver el MIPS correr paso a paso sin instalar nada, abra
+[`simulador_retro/index.html`](simulador_retro/README.md) en el navegador: un IDE retro
+donde se pega el `.asm`, se ejecuta y se inspeccionan registros, pila y memoria.
+
 Para MARS, descargue `Mars4_5.jar` y cópielo en `tools/` o indique su ruta en la variable
 de entorno `MARS_JAR`. También se puede abrir el `.asm` en la interfaz de MARS: ensamblar y
 ejecutar, sin cambiar ninguna opción.
