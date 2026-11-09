@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIPSTATION 3000</title>
+<meta name="description" content="IDE retro para ensamblar y simular MIPS32: pega el ensamblador que genera el compilador de Compiscript y ejecútalo paso a paso.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='2' fill='%23d9cfb4'/%3E%3Crect x='2' y='2' width='12' height='9' fill='%23031'/%3E%3Cpath d='M4 5h2v1H4zM4 7h5v1H4z' fill='%233f6'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Caveat:wght@600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+
+<div class="cuarto">
+  <div class="equipo">
+
+    <!-- ============ MONITOR ============ -->
+    <div class="monitor">
+
+      <div class="bisel">
+        <div class="pantalla" id="pantalla" data-fosforo="verde">
+          <div class="contenido" id="contenido">
+
+            <!-- barra de menús -->
+            <div class="menubar" id="menubar">
+              <button class="menu-btn" data-menu="archivo"><u>A</u>rchivo</button>
+              <button class="menu-btn" data-menu="ejemplos"><u>E</u>jemplos</button>
+              <button class="menu-btn" data-menu="ejecutar">E<u>j</u>ecutar</button>
+              <button class="menu-btn" data-menu="ver"><u>V</u>er</button>
+              <button class="menu-btn" data-menu="ayuda">Ay<u>u</u>da</button>
+              <span class="menubar-der"><span id="marca-modificado"></span> MIPSTATION 3000 · <span id="reloj">--:--</span></span>
+            </div>
+            <div class="desplegable" id="desplegable" hidden></div>
+
+            <!-- ventanas -->
+            <div class="escritorio">
+              <section class="ventana v-editor">
+                <h2 class="titulo">EDITOR · <span id="nombre-archivo">programa.asm</span></h2>
+                <div class="editor" id="editor">
+                  <div class="gutter" id="gutter" title="Clic en un número de línea: poner o quitar un punto de ruptura"></div>
+                  <div class="codigo" id="codigo">
+                    <div class="barra-linea" id="barra-actual" hidden></div>
+                    <div class="barra-linea error" id="barra-error" hidden></div>
+                    <pre class="resaltado" id="resaltado" aria-hidden="true"></pre>
+                    <textarea id="fuente" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="Código MIPS32"></textarea>
+                  </div>
+                </div>
+              </section>
+
+              <section class="ventana v-consola">
+                <h2 class="titulo">CONSOLA E/S</h2>
+                <button class="mini-btn" id="limpiar-consola" title="Limpiar la consola">[LIMPIAR]</button>
+                <div class="consola" id="consola">
+                  <div class="consola-texto" id="consola-texto"></div>
+                  <div class="entrada" id="entrada" hidden>
+                    <span class="prompt" id="entrada-prompt">?&gt;</span>
+                    <input id="entrada-campo" type="text" autocomplete="off" spellcheck="false" aria-label="Entrada del programa">
+                  </div>
+                </div>
+              </section>
+
+              <section class="ventana v-registros">
+                <h2 class="titulo">REGISTROS</h2>
+                <div class="pestanas" role="tablist">
+                  <button class="pestana activa" data-tab="cpu" role="tab">CPU</button>
+                  <button class="pestana" data-tab="fpu" role="tab">FPU</button>
+                  <button class="pestana" data-tab="mem" role="tab">MEMORIA</button>
+                  <button class="pestana base" id="base-btn" title="Cambiar entre hexadecimal y decimal">HEX</button>
+                </div>
+                <div class="tab" id="tab-cpu">
+                  <div class="regs" id="regs"></div>
+                  <div class="subtitulo">── PILA ($sp) ──</div>
+                  <div class="pila" id="pila"></div>
+                </div>
+                <div class="tab" id="tab-fpu" hidden>
+                  <div class="fregs" id="fregs"></div>
+                </div>
+                <div class="tab" id="tab-mem" hidden>
+                  <div class="mem-ctrl">
+                    <label>DIR <input id="mem-dir" value="0x10010000" spellcheck="false"></label>
+                    <button class="mini-btn" data-ir="datos">.data</button>
+                    <button class="mini-btn" data-ir="gp">$gp</button>
+                    <button class="mini-btn" data-ir="sp">$sp</button>
+                    <button class="mini-btn" data-ir="heap">heap</button>
+                  </div>
+                  <div class="mem" id="mem"></div>
+                  <div class="mem-nav">
+                    <button class="mini-btn" data-mover="-64">◄◄</button>
+                    <button class="mini-btn" data-mover="-16">◄</button>
+                    <button class="mini-btn" data-mover="16">►</button>
+                    <button class="mini-btn" data-mover="64">►►</button>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <!-- línea de estado y teclas de función -->
+            <div class="estado" id="estado">
+              <span>ESTADO ▸ <b id="st-estado">SIN ENSAMBLAR</b></span>
+              <span>PC <b id="st-pc">0x00400000</b></span>
+              <span>LÍNEA <b id="st-linea">-</b></span>
+              <span>INSTR <b id="st-instr">0</b></span>
+              <button class="st-btn" id="st-vel" title="Velocidad de ejecución (clic para cambiar)">VEL ▸ <b>MÁX</b></button>
+            </div>
+            <div class="fkeys" id="fkeys">
+              <button data-accion="ensamblar"><b>F3</b>Ensamblar</button>
+              <button data-accion="ejecutar"><b>F5</b>Ejecutar</button>
+              <button data-accion="paso"><b>F7</b>Paso</button>
+              <button data-accion="pausa"><b>F8</b>Pausa</button>
+              <button data-accion="reiniciar"><b>F9</b>Reset</button>
+              <button data-accion="abrir"><b>^O</b>Abrir</button>
+              <button data-accion="guardar"><b>^S</b>Guardar</button>
+              <button data-accion="ayuda"><b>F1</b>Ayuda</button>
+            </div>
+          </div>
+
+          <!-- arranque -->
+          <div class="arranque" id="arranque" aria-live="polite"><pre id="arranque-texto"></pre></div>
+
+          <div class="modal-fondo" id="modal" hidden>
+            <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-titulo">
+              <h2 class="titulo" id="modal-titulo"></h2>
+              <div class="modal-cuerpo" id="modal-cuerpo"></div>
+              <div class="modal-botones" id="modal-botones"></div>
+            </div>
+          </div>
+
+          <div class="soltar" id="soltar" hidden>SUELTA EL ARCHIVO .ASM AQUÍ</div>
+
+          <!-- efectos del tubo -->
+          <div class="crt-lineas"></div>
+          <div class="crt-vineta"></div>
+          <div class="crt-reflejo"></div>
+        </div>
+      </div>
+
+      <div class="barbilla">
+        <div class="logo">
+          <span class="logo-icono" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span><b>MIPSTATION</b> 3000</span>
+        </div>
+        <div class="rejilla" aria-hidden="true"></div>
+        <div class="perillas">
+          <div class="perilla-caja">
+            <button class="perilla" id="perilla-brillo" aria-label="Brillo" title="Brillo (clic o rueda)"></button>
+            <span>BRILLO</span>
+          </div>
+          <div class="perilla-caja">
+            <button class="perilla" id="perilla-contraste" aria-label="Resplandor" title="Resplandor (clic o rueda)"></button>
+            <span>RESPLANDOR</span>
+          </div>
+          <div class="perilla-caja">
+            <span class="led" id="led-power"></span>
+            <button class="encendido" id="btn-power" aria-label="Encender o apagar"></button>
+            <span>POWER</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cuello" aria-hidden="true"></div>
+
+    <!-- ============ UNIDAD CENTRAL ============ -->
+    <div class="cpu">
+      <div class="placa">
+        <b>UVG</b> · CONSTRUCCIÓN DE COMPILADORES<br>
+        <small>CPU MIPS32 R2000 · FPU R2010 · 8 MB DE PILA</small>
+      </div>
+      <div class="nota" aria-hidden="true">
+        <b>¡no olvidar!</b>
+        F3 ensamblar<br>
+        F5 ejecutar<br>
+        F7 paso a paso<br>
+        F8 pausa · F9 reset<br>
+        clic en el nº de línea<br>= punto de ruptura ●
+      </div>
+      <div class="disquetera" id="disquetera" title="Clic para abrir un .asm, o arrastra un archivo aquí">
+        <div class="disquetera-etiqueta">UNIDAD A: · 3½" · 1.44 MB</div>
+        <div class="ranura"><div class="disco" id="disco"></div></div>
+        <div class="disquetera-pie">
+          <span class="led-disco" id="led-disco"></span>
+          <span class="disquetera-texto">arrastra aquí tu .asm o haz clic</span>
+          <button class="expulsar" id="btn-expulsar" title="Guardar el programa como .asm">⏏ GUARDAR</button>
+        </div>
+      </div>
+      <div class="cpu-leds">
+        <span><i class="led-mini" id="led-run"></i>RUN</span>
+        <span><i class="led-mini" id="led-err"></i>ERR</span>
+      </div>
+    </div>
+    <input type="file" id="archivo" accept=".asm,.s,.mips,.txt" hidden>
+  </div>
+</div>
+
+<script src="mips.js"></script>
+<script src="ejemplos.js"></script>
+<script src="ejemplos_compiscript.js"></script>
+<script src="ide.js"></script>
+</body>
+</html>
